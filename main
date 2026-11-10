@@ -1,0 +1,602 @@
+--[[ Ink Game: Dash
+
+Makes the game's own client see your Faster Sprint boost at level 5, the maximum. What the game works
+out from that -- the sprint speed, and the dash it offers -- is then the game's own work, not something
+this script fakes. Plain Roblox API, no client or library needed.
+
+Run it to switch it on, run it again to switch it off (your real values are put back).
+
+Where the boost lives (read off your own dump): a number under  Player.Boosts["Faster Sprint"],  and the
+same level written into the  _BoostData  attribute on the player, which is a JSON string. Both are held
+at LEVEL; if the server changes either, it is set back at once.
+
+The small C button copies the WHOLE console log to the clipboard, so there is nothing to screenshot:
+  tap it once               copy the console (a moment after the tap, so a triple tap can be told apart)
+  drag it                   moves it, while it is unlocked
+  triple tap                locks it where it is; triple tap again to unlock
+It stays on screen whether the boost is on or off. Without a clipboard function the log is saved to
+ink_dash_console.txt in the executor's workspace folder.
+  getgenv().InkDashDump(true)    prints a report of the values on you and your character in the console
+                                 (true: every value; leave it out for just speed / boost / dash)
+
+Limits: this only changes what YOUR client sees. If the server checks the boost before it accepts a
+dash, the button can show and the dash be refused; no client script can change that. ]]
+
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local StarterGui = game:GetService('StarterGui')
+local HttpService = game:GetService('HttpService')
+local LogService = game:GetService('LogService')
+local UserInputService = game:GetService('UserInputService')
+
+local lplr = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local LEVEL = 5                  -- the level to present
+local BOOSTS = {'Faster Sprint'} -- the boosts held at LEVEL
+local FORCE_WALK_SPEED           -- set a number to hold WalkSpeed there as well (nil: leave speed to the game)
+local REVEAL_DASH = true         -- show a dash button the game has drawn but left hidden
+local SCAN_EVERY = 2             -- seconds between looks for values the game made late
+local REPORT_ON_RUN = false      -- print the report of your values into the console every run
+local REPORT_ALL = true          -- ... with every value on you and your character, not only speed / boost / dash
+local MAX_CHARS = 500000         -- the copy keeps the newest lines if the log is longer than this
+
+local LEVEL_WORDS = {'level', 'lvl', 'tier', 'upgrade', 'rank'}
+local REPORT_WORDS = {'speed', 'sprint', 'dash', 'charge', 'boost', 'level', 'lvl', 'tier', 'upgrade', 'rank', 'stamina', 'power', 'roll', 'slide', 'run'}
+-- Rig and effect bookkeeping that fills a full dump and says nothing about the game.
+local NOISE = {'attachment', 'originalsize', 'originalposition', 'avatarpartscaletype', 'r15', 'emitter', 'animate', 'accessory', '_shell', 'bonecustom', 'bodytypescale', 'bodyproportion', 'bodywidth', 'bodyheight', 'bodydepth', 'headscale', 'orientation'}
+
+local valueLocks = {}      -- [Value instance] = {Connection, Original}
+local attributeLocks = {}  -- [instance] = {[attribute] = {Connection, Original}}
+local boostData            -- {Connection, Original} for the _BoostData attribute
+local announced = {}
+local revealed = {}        -- [button] = the Visible it had before this script showed it
+local dataFolders = {}
+local nextDataSearch = 0
+local scanClock = 0
+local heartbeat
+local characterAdded
+
+local function say(text)
+	print('[Ink Dash] '..text)
+	pcall(function()
+		StarterGui:SetCore('SendNotification', {Title = 'Ink Dash', Text = text, Duration = 4})
+	end)
+end
+
+local function announce(key, text)
+	if not announced[key] then
+		announced[key] = true
+		say(text)
+	end
+end
+
+local function hasWord(text, words)
+	text = string.lower(text)
+	for _, word in words do
+		if text:find(word, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- The full name without the {guid} the executor puts in front of the game.
+local function pathOf(instance)
+	return (instance:GetFullName():gsub('^%b{}%.', ''))
+end
+
+-- "speed" in the name or in the folders just above it, a level word in the name, and not a "max" of something.
+local function isSpeedLevel(instance, name)
+	local lowered = string.lower(name)
+	if lowered:find('max', 1, true) or not hasWord(name, LEVEL_WORDS) then
+		return false
+	end
+	local node, depth = instance, 0
+	local speed = lowered:find('speed', 1, true) ~= nil
+	while not speed and node and node ~= game and depth < 3 do
+		node = node.Parent
+		depth += 1
+		speed = node ~= nil and node ~= game and string.lower(node.Name):find('speed', 1, true) ~= nil
+	end
+	return speed
+end
+
+local function lockValue(value)
+	if valueLocks[value] then return end
+	local lock = {Original = value.Value}
+	valueLocks[value] = lock
+	local function hold()
+		if value.Value ~= LEVEL then
+			value.Value = LEVEL
+		end
+	end
+	hold()
+	lock.Connection = value:GetPropertyChangedSignal('Value'):Connect(hold)
+	announce(value, string.format('%s was %s, now %d', pathOf(value), tostring(lock.Original), LEVEL))
+end
+
+local function lockAttribute(instance, attribute)
+	local locks = attributeLocks[instance]
+	if not locks then
+		locks = {}
+		attributeLocks[instance] = locks
+	end
+	if locks[attribute] then return end
+	local lock = {Original = instance:GetAttribute(attribute)}
+	locks[attribute] = lock
+	local function hold()
+		if instance:GetAttribute(attribute) ~= LEVEL then
+			instance:SetAttribute(attribute, LEVEL)
+		end
+	end
+	hold()
+	lock.Connection = instance:GetAttributeChangedSignal(attribute):Connect(hold)
+	announce(instance, string.format('%s [%s] was %s, now %d', pathOf(instance), attribute, tostring(lock.Original), LEVEL))
+end
+
+-- Player.Boosts["Faster Sprint"]: the number the game keeps for each boost.
+local function lockBoostValues()
+	local folder = lplr:FindFirstChild('Boosts')
+	if not folder then return end
+	for _, name in BOOSTS do
+		local value = folder:FindFirstChild(name)
+		if value and (value:IsA('IntValue') or value:IsA('NumberValue')) then
+			lockValue(value)
+		end
+	end
+end
+
+-- _BoostData: the same levels as a JSON string on the player. Only boosts already in it are touched.
+local function lockBoostData()
+	if boostData or type(lplr:GetAttribute('_BoostData')) ~= 'string' then return end
+	local lock = {Original = lplr:GetAttribute('_BoostData')}
+	boostData = lock
+	local function hold()
+		local raw = lplr:GetAttribute('_BoostData')
+		if type(raw) ~= 'string' then return end
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(raw)
+		end)
+		if not ok or type(data) ~= 'table' then return end
+		local changed = false
+		for _, name in BOOSTS do
+			if data[name] ~= nil and data[name] ~= LEVEL then
+				data[name] = LEVEL
+				changed = true
+			end
+		end
+		if changed then
+			lplr:SetAttribute('_BoostData', HttpService:JSONEncode(data))
+		end
+	end
+	hold()
+	lock.Connection = lplr:GetAttributeChangedSignal('_BoostData'):Connect(hold)
+	announce('boostdata', '_BoostData was '..lock.Original..', now '..tostring(lplr:GetAttribute('_BoostData')))
+end
+
+local function inspect(instance)
+	if instance:IsA('IntValue') or instance:IsA('NumberValue') then
+		if isSpeedLevel(instance, instance.Name) then
+			lockValue(instance)
+		end
+	end
+	for attribute, value in instance:GetAttributes() do
+		if type(value) == 'number' and isSpeedLevel(instance, attribute) then
+			lockAttribute(instance, attribute)
+		end
+	end
+end
+
+-- Per-player data kept in ReplicatedStorage, in a folder named for you; looked for now and then, not every scan.
+local function findDataFolders()
+	if os.clock() < nextDataSearch then return end
+	nextDataSearch = os.clock() + 10
+	table.clear(dataFolders)
+	local name, id = lplr.Name, tostring(lplr.UserId)
+	for _, descendant in ReplicatedStorage:GetDescendants() do
+		if descendant.Name == name or descendant.Name == id then
+			table.insert(dataFolders, descendant)
+		end
+	end
+end
+
+local function scan()
+	lockBoostValues()
+	lockBoostData()
+	findDataFolders()
+	local roots = {}
+	if lplr.Character then
+		table.insert(roots, lplr.Character)
+	end
+	for _, child in lplr:GetChildren() do
+		if child.ClassName ~= 'PlayerGui' and child.ClassName ~= 'Backpack' and child.ClassName ~= 'PlayerScripts' then
+			table.insert(roots, child)
+		end
+	end
+	inspect(lplr)
+	for _, folder in dataFolders do
+		table.insert(roots, folder)
+	end
+	for _, root in roots do
+		inspect(root)
+		for _, descendant in root:GetDescendants() do
+			inspect(descendant)
+		end
+	end
+end
+
+-- Anything under a gui with "shop" in its name: its pages describe powers in words, dash included.
+local function inShop(object)
+	local node = object
+	while node and not node:IsA('PlayerGui') do
+		if string.lower(node.Name):find('shop', 1, true) then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+-- A dash button the game drew: a button named or labelled "dash", or the button around a label that says it.
+local function dashButtons()
+	local found = {}
+	local gui = lplr:FindFirstChildOfClass('PlayerGui')
+	if not gui then return found end
+	for _, object in gui:GetDescendants() do
+		local button
+		if object:IsA('GuiButton') then
+			local label = string.lower(object.Name)
+			if object:IsA('TextButton') then
+				label ..= ' '..string.lower(object.Text)
+			end
+			if label:find('dash', 1, true) then
+				button = object
+			end
+		elseif object:IsA('TextLabel') and string.lower(object.Text):find('dash', 1, true) then
+			button = object:FindFirstAncestorWhichIsA('GuiButton')
+		end
+		if button and not inShop(button) and not table.find(found, button) then
+			table.insert(found, button)
+		end
+	end
+	return found
+end
+
+-- Whether the button and everything above it is switched on (a hidden parent hides it however its own flag reads).
+local function onScreen(button)
+	local node = button
+	while node and not node:IsA('PlayerGui') do
+		if node:IsA('GuiObject') and not node.Visible then
+			return false
+		end
+		if node:IsA('ScreenGui') and not node.Enabled then
+			return false
+		end
+		node = node.Parent
+	end
+	return true
+end
+
+local function reveal()
+	for _, button in dashButtons() do
+		if REVEAL_DASH and not button.Visible then
+			revealed[button] = false
+			button.Visible = true
+		end
+		announce(button, string.format('dash button: %s (%s)', pathOf(button), onScreen(button) and 'on screen' or 'hidden by something above it'))
+	end
+end
+
+local function step(delta)
+	if FORCE_WALK_SPEED then
+		local character = lplr.Character
+		local humanoid = character and character:FindFirstChildOfClass('Humanoid')
+		if humanoid and humanoid.WalkSpeed ~= FORCE_WALK_SPEED then
+			humanoid.WalkSpeed = FORCE_WALK_SPEED
+		end
+	end
+	scanClock += delta
+	if scanClock >= SCAN_EVERY then
+		scanClock = 0
+		scan()
+		reveal()
+	end
+end
+
+-- The report, as lines. all: every value and attribute instead of the ones that read as speed, boost or dash. raw: keep the rig noise.
+local function buildReport(all, raw)
+	local lines = {}
+	local function add(text)
+		table.insert(lines, text)
+	end
+
+	local function wanted(name)
+		if not raw and hasWord(name, NOISE) then return false end
+		return all or hasWord(name, REPORT_WORDS)
+	end
+
+	local function show(instance)
+		local entries = {}
+		if instance:IsA('ValueBase') and wanted(instance.Name) then
+			table.insert(entries, string.format('value     %s = %s', pathOf(instance), tostring(instance.Value)))
+		end
+		local attributes = {}
+		for attribute in instance:GetAttributes() do
+			table.insert(attributes, attribute)
+		end
+		table.sort(attributes)
+		for _, attribute in attributes do
+			if wanted(attribute) then
+				table.insert(entries, string.format('attribute %s [%s] = %s', pathOf(instance), attribute, tostring(instance:GetAttribute(attribute))))
+			end
+		end
+		for _, entry in entries do
+			add(entry)
+		end
+	end
+
+	local function walk(root, skipGui)
+		show(root)
+		local playerGui = lplr:FindFirstChildOfClass('PlayerGui')
+		for _, descendant in root:GetDescendants() do
+			local inScripts = descendant:FindFirstAncestorOfClass('PlayerScripts') ~= nil
+			local inGui = playerGui ~= nil and descendant:IsDescendantOf(playerGui)
+			if not inScripts and not (skipGui and inGui) then
+				show(descendant)
+			end
+		end
+	end
+
+	add(string.format('Ink Dash report -- place %s, %s', tostring(game.PlaceId), all and 'everything' or 'speed / boost / dash'))
+	add('== you ==')
+	walk(lplr, true)
+	add('== your character ==')
+	if lplr.Character then
+		walk(lplr.Character, true)
+	end
+	findDataFolders()
+	if #dataFolders > 0 then
+		add('== data folders ==')
+		for _, folder in dataFolders do
+			walk(folder, true)
+		end
+	end
+	add('== buttons ==')
+	local gui = lplr:FindFirstChildOfClass('PlayerGui')
+	if gui then
+		for _, object in gui:GetDescendants() do
+			if object:IsA('GuiButton') and not inShop(object) and hasWord(object.Name, REPORT_WORDS) then
+				add(string.format('button    %s  Visible=%s  OnScreen=%s', pathOf(object), tostring(object.Visible), tostring(onScreen(object))))
+			end
+		end
+	end
+	local humanoid = lplr.Character and lplr.Character:FindFirstChildOfClass('Humanoid')
+	add('== speed ==')
+	add('WalkSpeed = '..tostring(humanoid and humanoid.WalkSpeed or 'no character'))
+	add(string.format('presenting level %d: %s', LEVEL, env.InkDash and 'on' or 'off'))
+	return lines
+end
+
+local function copyText(text)
+	local copy = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+	if type(copy) ~= 'function' then
+		return false
+	end
+	return pcall(copy, text)
+end
+
+local MESSAGE_TYPES = {
+	[Enum.MessageType.MessageOutput] = 'OUTPUT',
+	[Enum.MessageType.MessageInfo] = 'INFO',
+	[Enum.MessageType.MessageWarning] = 'WARN',
+	[Enum.MessageType.MessageError] = 'ERROR'
+}
+
+-- Everything the console holds, oldest first, one line each with its time and kind.
+local function consoleText()
+	local lines = {}
+	for _, entry in LogService:GetLogHistory() do
+		local stamp = '--:--:--'
+		pcall(function()
+			stamp = os.date('%H:%M:%S', entry.timestamp)
+		end)
+		table.insert(lines, string.format('%s %-6s %s', stamp, MESSAGE_TYPES[entry.messageType] or '?', tostring(entry.message)))
+	end
+	local text = table.concat(lines, '\n')
+	if #text > MAX_CHARS then
+		text = '[older lines cut]\n'..string.sub(text, -MAX_CHARS)
+	end
+	return text, #lines
+end
+
+local function copyConsole()
+	local text, count = consoleText()
+	if copyText(text) then
+		say(string.format('copied the whole console (%d lines) -- paste it in the chat', count))
+	elseif writefile and pcall(writefile, 'ink_dash_console.txt', text) then
+		say(string.format('no clipboard here: saved %d lines to ink_dash_console.txt in your workspace folder', count))
+	else
+		say('no clipboard and no file access here, so the console could not be copied')
+	end
+end
+
+-- The C button: tap copies the console, drag moves it, triple tap locks it in place.
+local BUTTON_SIZE = 32
+local TAP_WINDOW = 0.45   -- taps this close together count as one press sequence
+local DRAG_START = 8      -- pixels a finger must travel before it counts as a drag
+
+local function buildButton()
+	local existing = env.InkDashButton
+	if existing and existing.Parent then return end
+
+	local gui = Instance.new('ScreenGui')
+	gui.Name = 'InkDashC'
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local function viewport()
+		local camera = workspace.CurrentCamera
+		return camera and camera.ViewportSize or Vector2.new(800, 600)
+	end
+
+	local button = Instance.new('TextButton')
+	button.Name = 'C'
+	button.AutoButtonColor = false
+	button.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	button.BackgroundTransparency = 0.25
+	button.Font = Enum.Font.GothamBold
+	button.Text = 'C'
+	button.TextColor3 = Color3.new(1, 1, 1)
+	button.TextSize = 16
+	button.Size = UDim2.fromOffset(BUTTON_SIZE, BUTTON_SIZE)
+	button.Position = UDim2.fromOffset(viewport().X - BUTTON_SIZE - 12, viewport().Y * 0.4)
+	local corner = Instance.new('UICorner')
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = button
+	local stroke = Instance.new('UIStroke')
+	stroke.Thickness = 2
+	stroke.Parent = button
+	button.Parent = gui
+
+	local locked = false
+	local function paint()
+		stroke.Color = locked and Color3.fromRGB(80, 220, 120) or Color3.new(1, 1, 1)
+		stroke.Transparency = locked and 0 or 0.4
+	end
+	paint()
+
+	-- Taps are counted until none follows for TAP_WINDOW: three or more lock or unlock it, fewer copy the console.
+	local taps, token = 0, 0
+	local function tapped()
+		taps += 1
+		token += 1
+		local mine = token
+		task.delay(TAP_WINDOW, function()
+			if mine ~= token then return end
+			local count = taps
+			taps = 0
+			if count >= 3 then
+				locked = not locked
+				paint()
+				say(locked and 'C button locked in place' or 'C button unlocked, drag it anywhere')
+			else
+				copyConsole()
+			end
+		end)
+	end
+
+	local connections = {}
+	local dragging, origin, start, moved
+	table.insert(connections, button.InputBegan:Connect(function(input)
+		local kind = input.UserInputType
+		if dragging or (kind ~= Enum.UserInputType.Touch and kind ~= Enum.UserInputType.MouseButton1) then return end
+		dragging, origin, start, moved = input, input.Position, button.Position, false
+	end))
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if not dragging or not (input == dragging or input.UserInputType == Enum.UserInputType.MouseMovement) then return end
+		local offset = Vector2.new(input.Position.X - origin.X, input.Position.Y - origin.Y)
+		if offset.Magnitude > DRAG_START then
+			moved = true
+		end
+		if moved and not locked then
+			local size = viewport()
+			button.Position = UDim2.fromOffset(
+				math.clamp(start.X.Offset + offset.X, 0, size.X - BUTTON_SIZE),
+				math.clamp(start.Y.Offset + offset.Y, 0, size.Y - BUTTON_SIZE)
+			)
+		end
+	end))
+	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+		local kind = input.UserInputType
+		if not dragging or not (input == dragging or (kind == Enum.UserInputType.MouseButton1 and dragging.UserInputType == kind)) then return end
+		local wasMoved = moved
+		dragging = nil
+		if not wasMoved then
+			tapped()
+		end
+	end))
+	gui.Destroying:Connect(function()
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+	end)
+
+	-- Out of reach of the game's own gui where the executor has a place for that, else the player's gui.
+	local ok = pcall(function()
+		gui.Parent = (gethui and gethui()) or game:GetService('CoreGui')
+	end)
+	if not ok or not gui.Parent then
+		gui.Parent = lplr:WaitForChild('PlayerGui')
+	end
+	env.InkDashButton = gui
+end
+
+local InkDash = {}
+
+function InkDash:Stop()
+	if heartbeat then heartbeat:Disconnect() end
+	if characterAdded then characterAdded:Disconnect() end
+	for value, lock in valueLocks do
+		lock.Connection:Disconnect()
+		pcall(function() value.Value = lock.Original end)
+	end
+	for instance, locks in attributeLocks do
+		for attribute, lock in locks do
+			lock.Connection:Disconnect()
+			pcall(function() instance:SetAttribute(attribute, lock.Original) end)
+		end
+	end
+	if boostData then
+		boostData.Connection:Disconnect()
+		pcall(function() lplr:SetAttribute('_BoostData', boostData.Original) end)
+		boostData = nil
+	end
+	for button, original in revealed do
+		pcall(function() button.Visible = original end)
+	end
+	table.clear(revealed)
+	table.clear(valueLocks)
+	table.clear(attributeLocks)
+	say('off, values put back')
+end
+
+-- Print the report in the console.
+function InkDash.Dump(all, raw)
+	for _, line in buildReport(all, raw) do
+		print(line)
+	end
+end
+
+-- Copy the whole console to the clipboard now.
+function InkDash.Copy()
+	copyConsole()
+end
+
+-- Reachable whether it is on or off.
+env.InkDashDump = InkDash.Dump
+env.InkDashCopy = InkDash.Copy
+buildButton()
+
+-- Running it twice is the off switch.
+if env.InkDash then
+	env.InkDash:Stop()
+	env.InkDash = nil
+	return
+end
+
+env.InkDash = InkDash
+heartbeat = RunService.Heartbeat:Connect(step)
+characterAdded = lplr.CharacterAdded:Connect(function()
+	task.wait(1)
+	scanClock = SCAN_EVERY
+end)
+scan()
+reveal()
+say('on, presenting boost level '..LEVEL)
+if REPORT_ON_RUN then
+	InkDash.Dump(REPORT_ALL)
+end
